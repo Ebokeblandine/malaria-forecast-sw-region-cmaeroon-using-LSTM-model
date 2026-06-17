@@ -225,6 +225,24 @@ def clear_all_forecasts():
     conn.commit()
     conn.close()
 
+def create_new_user(username, password, full_name, role):
+    try:
+        conn = sqlite3.connect("malaria_forecasts.db")
+        hashed_pw = hashlib.sha256(password.encode()).hexdigest()
+        conn.execute("""
+            INSERT INTO users (username, password, full_name, role, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (username, hashed_pw, full_name, role,
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        st.error(f"Database error: {e}")
+        return False
+
 # ─────────────────────────────────────────────────────────────
 # MODEL DEFINITION
 # ─────────────────────────────────────────────────────────────
@@ -422,15 +440,19 @@ with st.sidebar:
     st.markdown("## 🦟 Malaria Forecast")
     st.markdown("**SW Cameroon Health Districts**")
     st.markdown("---")
+    
     page = st.radio(
-        "Navigate to:",
-        ["🏠 Dashboard",
-         "📊 Generate Forecast",
-         "📈 Trends",
-         "🔍 Model Insights",
-         "📋 Forecast History"],
-        label_visibility="collapsed"
-    )
+    "Navigate to:",
+    ["🏠 Dashboard",
+     "📊 Generate Forecast",
+     "📈 Trends",
+     "🔍 Model Insights",
+     "📋 Forecast History",
+     "🗃 Data Viewer",      # ← New page
+     "⚙️ Admin"],
+    label_visibility="collapsed"
+)
+
     st.markdown("---")
     st.markdown("**Districts covered:**")
     for d in DISTRICTS:
@@ -1027,4 +1049,189 @@ elif page == "📋 Forecast History":
         with col_cl:
             if st.button("🗑 Clear all forecasts"):
                 clear_all_forecasts()
+          
+# ═════════════════════════════════════════════════════════════
+# PAGE 6 — DATABASE VIEWER
+# ═════════════════════════════════════════════════════════════
+elif page == "🗃 Data Viewer":
+    st.markdown('<div class="main-title">🗃 Database & Historical Data Viewer</div>', 
+                unsafe_allow_html=True)
+    st.subheader("South West Region Malaria + Climate Dataset (2015–2024)")
+
+    # Load data
+    df = load_raw()          # Try raw data first
+    if df is None:
+        df = load_processed()
+    
+    if df is None:
+        st.error("No dataset found. Please place your CSV file in this folder.")
+        st.stop()
+
+    # Clean column names if needed
+    df.columns = [col.strip() for col in df.columns]
+
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        selected_districts = st.multiselect(
+            "Select District(s)", 
+            options=DISTRICTS, 
+            default=DISTRICTS
+        )
+    with col2:
+        selected_years = st.multiselect(
+            "Select Year(s)", 
+            options=sorted(df["Year"].unique()),
+            default=sorted(df["Year"].unique())
+        )
+    with col3:
+        months_available = sorted(df["Month"].unique()) if "Month" in df.columns else MONTHS
+        selected_months = st.multiselect(
+            "Select Month(s)", 
+            options=months_available,
+            default=months_available
+        )
+
+    # Filter the dataframe
+    filtered_df = df[
+        (df["District"].isin(selected_districts)) &
+        (df["Year"].isin(selected_years))
+    ]
+    
+    if "Month" in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df["Month"].isin(selected_months)]
+
+    # Summary Statistics
+    st.markdown('<div class="section-header">📊 Summary Statistics</div>', unsafe_allow_html=True)
+    summary = filtered_df.groupby("District").agg({
+        "Confirmed_Malaria_Cases": ["count", "mean", "min", "max", "sum"]
+    }).round(1)
+    summary.columns = ["Records", "Avg Cases", "Min", "Max", "Total Cases"]
+    st.dataframe(summary, use_container_width=True)
+
+    # Main Data Table
+    st.markdown('<div class="section-header">📋 Full Historical Data</div>', unsafe_allow_html=True)
+    
+    # Select columns to display
+    display_cols = [col for col in ["District", "Year", "Month", "Confirmed_Malaria_Cases", 
+                                  "Rainfall_mm", "Temperature_C", "RH_percent"] 
+                   if col in filtered_df.columns]
+    
+    st.dataframe(
+        filtered_df[display_cols].sort_values(["District", "Year", "Month"]),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # Download Button
+    csv = filtered_df.to_csv(index=False)
+    st.download_button(
+        label="⬇️ Download Filtered Data as CSV",
+        data=csv,
+        file_name="malaria_filtered_data.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # Quick Visualization
+    st.markdown('<div class="section-header">📈 Cases Trend (Filtered)</div>', unsafe_allow_html=True)
+    if len(filtered_df) > 0:
+        fig = px.line(
+            filtered_df.sort_values(["District","Year","Month"]),
+            x="Year", 
+            y="Confirmed_Malaria_Cases",
+            color="District",
+            markers=True,
+            title="Malaria Cases Trend by District (Filtered View)"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No data matches the current filters.")
+        
+        # ═════════════════════════════════════════════════════════════
+# PAGE — ADMIN DASHBOARD
+# ═════════════════════════════════════════════════════════════
+elif page == "⚙️ Admin":
+    st.markdown('<div class="main-title">⚙️ Admin Dashboard</div>', unsafe_allow_html=True)
+    st.subheader("System Management")
+
+    if st.session_state.username != "admin":
+        st.error("🔒 Only the Administrator can access this page.")
+        st.stop()
+
+    tab1, tab2, tab3 = st.tabs(["👤 User Management", "📊 System Overview", "🗑️ Maintenance"])
+
+    # TAB 1: User Management
+    with tab1:
+        st.subheader("Create New Health Officer Account")
+        
+        with st.form("new_user_form", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_username = st.text_input("Username")
+                new_fullname = st.text_input("Full Name", value="Health Officer")
+            with col2:
+                new_password = st.text_input("Password", type="password")
+                new_role = st.selectbox("Role", ["officer", "admin"])
+            
+            submitted = st.form_submit_button("✅ Create User")
+            
+            if submitted:
+                if new_username and new_password:
+                    if create_new_user(new_username, new_password, new_fullname, new_role):
+                        st.success(f"✅ User **{new_username}** created successfully!")
+                    else:
+                        st.error("❌ Username already exists. Choose another.")
+                else:
+                    st.warning("Please fill in all required fields.")
+
+        st.markdown("---")
+        st.subheader("Existing Users")
+        conn = sqlite3.connect("malaria_forecasts.db")
+        users_df = pd.read_sql_query(
+            "SELECT username, full_name, role, created_at FROM users ORDER BY created_at DESC", 
+            conn
+        )
+        conn.close()
+        
+        if not users_df.empty:
+            st.dataframe(users_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No users found.")
+
+    # TAB 2: System Overview
+    with tab2:
+        st.subheader("System Information")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            total_forecasts = len(load_forecast_history())
+            st.metric("Total Forecasts", total_forecasts)
+        with col2:
+            conn = sqlite3.connect("malaria_forecasts.db")
+            total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            conn.close()
+            st.metric("Registered Users", total_users)
+        with col3:
+            st.metric("Districts Covered", len(DISTRICTS))
+
+        st.markdown("---")
+        st.subheader("Recent Forecasts")
+        recent = load_forecast_history().head(10)
+        if not recent.empty:
+            st.dataframe(recent[["district", "month_name", "year", "prediction", "risk_level", "created_at"]], 
+                        use_container_width=True, hide_index=True)
+        else:
+            st.info("No forecasts yet.")
+
+    # TAB 3: Maintenance
+    with tab3:
+        st.subheader("Database Maintenance")
+        
+        if st.button("🗑️ Clear All Forecasts", type="secondary"):
+            if st.checkbox("I am sure I want to delete ALL forecasts"):
+                clear_all_forecasts()
+                st.success("All forecasts have been cleared.")
                 st.rerun()
+
+        st.warning("⚠️ This action cannot be undone.")
