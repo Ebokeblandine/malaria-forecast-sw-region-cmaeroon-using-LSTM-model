@@ -8,30 +8,9 @@ import pickle
 import os
 from datetime import datetime
 from PIL import Image
-try:
-    import importlib
-    plotly = importlib.import_module('plotly')
-    px = importlib.import_module('plotly.express')
-    go = importlib.import_module('plotly.graph_objects')
-    # import subplots dynamically to avoid static import errors in editors/linters
-    try:
-        subplots_mod = importlib.import_module('plotly.subplots')
-        make_subplots = getattr(subplots_mod, 'make_subplots', None)
-    except Exception:
-        make_subplots = None
-except Exception:
-    px = None
-    go = None
-    make_subplots = None
-
-# Ensure required plotting libs are available
-if px is None or go is None or make_subplots is None:
-    try:
-        import streamlit as _st
-        _st.error("Missing dependency: plotly is not installed. Please install plotly (pip install plotly) and restart the app.")
-        _st.stop()
-    except Exception:
-        raise
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # PAGE CONFIG
 st.set_page_config(
@@ -157,11 +136,37 @@ DISTRICTS   = ["Buea", "Limbe", "Muyuka", "Tiko", "Kumba"]
 MONTHS      = ["January","February","March","April","May","June",
                "July","August","September","October","November","December"]
 MONTH_MAP   = {m:i+1 for i,m in enumerate(MONTHS)}
-FEATURES    = ["Month_Num","Rainfall_mm","Temperature_C","RH_percent",
-               "Rainfall_lag1","Rainfall_lag2","Cases_lag1","Cases_lag2"]
 
-RAW_MINS = {"Rainfall_mm":34.0,"Temperature_C":24.5,"RH_percent":71.1}
-RAW_MAXS = {"Rainfall_mm":559.9,"Temperature_C":27.9,"RH_percent":93.0}
+# RAW (unscaled) column names — used to read from processed CSV
+RAW_COLS = ["Month_Num","Rainfall_mm","Temperature_C","RH_percent",
+            "Rainfall_lag1","Rainfall_lag2","Cases_lag1","Cases_lag2",
+            "Confirmed_Malaria_Cases"]
+
+# MinMax ranges from training data — used to scale inputs manually
+RAW_MINS = {
+    "Month_Num":      1.0,
+    "Rainfall_mm":   34.0,
+    "Temperature_C": 24.5,
+    "RH_percent":    71.1,
+    "Rainfall_lag1": 34.0,
+    "Rainfall_lag2": 34.0,
+    "Cases_lag1":   200.0,
+    "Cases_lag2":   200.0,
+}
+RAW_MAXS = {
+    "Month_Num":      12.0,
+    "Rainfall_mm":   559.9,
+    "Temperature_C":  27.9,
+    "RH_percent":     93.0,
+    "Rainfall_lag1": 559.9,
+    "Rainfall_lag2": 559.9,
+    "Cases_lag1":   1400.0,
+    "Cases_lag2":   1400.0,
+}
+
+# Order the model expects
+FEATURES = ["Month_Num","Rainfall_mm","Temperature_C","RH_percent",
+            "Rainfall_lag1","Rainfall_lag2","Cases_lag1","Cases_lag2"]
 
 DIST_COLORS = {
     "Buea":"#378ADD","Limbe":"#1D9E75","Muyuka":"#D85A30",
@@ -284,9 +289,25 @@ def load_raw():
 # ─────────────────────────────────────────────────────────────
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────
-def scale_value(val, col):
+def scale_col(val, col):
+    """MinMax scale a single raw value using training-data ranges."""
     mn = RAW_MINS[col]; mx = RAW_MAXS[col]
-    return (val - mn) / (mx - mn)
+    scaled = (val - mn) / (mx - mn)
+    return float(np.clip(scaled, 0.0, 1.0))   # clamp to [0,1]
+
+def build_scaled_row(month_num, rainfall, temperature, humidity,
+                     rain_lag1, rain_lag2, case_lag1, case_lag2):
+    """Return one scaled feature row in model input order."""
+    return [
+        scale_col(month_num,    "Month_Num"),
+        scale_col(rainfall,     "Rainfall_mm"),
+        scale_col(temperature,  "Temperature_C"),
+        scale_col(humidity,     "RH_percent"),
+        scale_col(rain_lag1,    "Rainfall_lag1"),
+        scale_col(rain_lag2,    "Rainfall_lag2"),
+        scale_col(case_lag1,    "Cases_lag1"),
+        scale_col(case_lag2,    "Cases_lag2"),
+    ]
 
 def get_risk_level(cases):
     if   cases < 400:  return "LOW",       "#27500A", "risk-low"
@@ -299,32 +320,92 @@ def risk_emoji(level):
 
 def predict(model, scaler_y, df_proc, district,
             month_num, rainfall, temperature, humidity):
+    """
+    Build a 3-month LSTM input sequence entirely from RAW values,
+    scale every column correctly, then run inference.
+
+    Sequence layout (3 rows × 8 features):
+      row 0  = 2 months ago  (from processed CSV — raw columns)
+      row 1  = 1 month ago   (from processed CSV — raw columns)
+      row 2  = current month (user inputs + derived lags)
+    """
+    # ── Pull last 2 months of RAW data for this district ─────
+    needed = ["Month_Num","Rainfall_mm","Temperature_C","RH_percent",
+              "Confirmed_Malaria_Cases"]
     dist_df = df_proc[df_proc["District"] == district].copy()
+
+    # Check required columns exist
+    missing = [c for c in needed if c not in dist_df.columns]
+    if missing:
+        st.error(f"CSV is missing columns: {missing}. "
+                 "Please upload the full processed_malaria_dataset.csv")
+        return None
+
     if len(dist_df) < 2:
         return None
-    last2 = dist_df.tail(2)[FEATURES].values.astype(np.float32)
 
-    r_scaled  = scale_value(rainfall,    "Rainfall_mm")
-    t_scaled  = scale_value(temperature, "Temperature_C")
-    rh_scaled = scale_value(humidity,    "RH_percent")
+    dist_df = dist_df.sort_values(["Year","Month_Num"]).reset_index(drop=True)
+    last2   = dist_df.tail(2)[needed].values   # shape (2, 5) — RAW values
 
-    rain_lag1 = float(last2[-1, FEATURES.index("Rainfall_mm")])
-    rain_lag2 = float(last2[-2, FEATURES.index("Rainfall_mm")])
-    case_lag1 = float(last2[-1, FEATURES.index("Cases_lag1")])
-    case_lag2 = float(last2[-2, FEATURES.index("Cases_lag1")])
+    # Row indices
+    r_minus2 = last2[0]   # 2 months ago: [Month_Num, Rain, Temp, RH, Cases]
+    r_minus1 = last2[1]   # 1 month ago
 
-    month_scaled = (month_num - 1) / 11.0
-    new_row = np.array([[month_scaled, r_scaled, t_scaled, rh_scaled,
-                         rain_lag1, rain_lag2, case_lag1, case_lag2]],
-                       dtype=np.float32)
+    # Unpack raw values
+    mn_2, rain_2, temp_2, rh_2, cases_2 = r_minus2
+    mn_1, rain_1, temp_1, rh_1, cases_1 = r_minus1
 
-    seq   = np.concatenate([last2, new_row], axis=0)
-    seq_t = torch.tensor(seq[np.newaxis, :, :], dtype=torch.float32)
+    # ── Build 3 fully-scaled rows ─────────────────────────────
+    # Row 0: 2 months ago
+    # lag1 of that row = 3 months ago (unknown — use same-district mean as fallback)
+    dist_mean_rain  = float(dist_df["Rainfall_mm"].mean())
+    dist_mean_cases = float(dist_df["Confirmed_Malaria_Cases"].mean())
+
+    row0 = build_scaled_row(
+        month_num  = mn_2,
+        rainfall   = rain_2,
+        temperature= temp_2,
+        humidity   = rh_2,
+        rain_lag1  = dist_mean_rain,   # 3 months ago — use mean as proxy
+        rain_lag2  = dist_mean_rain,
+        case_lag1  = dist_mean_cases,
+        case_lag2  = dist_mean_cases,
+    )
+
+    # Row 1: 1 month ago — lags are known from row 0
+    row1 = build_scaled_row(
+        month_num  = mn_1,
+        rainfall   = rain_1,
+        temperature= temp_1,
+        humidity   = rh_1,
+        rain_lag1  = rain_2,    # actual rainfall 2 months ago
+        rain_lag2  = dist_mean_rain,
+        case_lag1  = cases_2,   # actual cases 2 months ago
+        case_lag2  = dist_mean_cases,
+    )
+
+    # Row 2: current user input — lags come from the two real months above
+    row2 = build_scaled_row(
+        month_num  = month_num,
+        rainfall   = rainfall,
+        temperature= temperature,
+        humidity   = humidity,
+        rain_lag1  = rain_1,    # last month's real rainfall
+        rain_lag2  = rain_2,    # 2 months ago real rainfall
+        case_lag1  = cases_1,   # last month's real cases
+        case_lag2  = cases_2,   # 2 months ago real cases
+    )
+
+    # ── Stack into (1, 3, 8) tensor and run model ─────────────
+    seq   = np.array([row0, row1, row2], dtype=np.float32)   # (3, 8)
+    seq_t = torch.tensor(seq[np.newaxis, :, :])              # (1, 3, 8)
 
     with torch.no_grad():
-        pred_scaled = model(seq_t).numpy()
+        pred_scaled = model(seq_t).numpy()                   # (1, 1)
+
     pred = float(scaler_y.inverse_transform(pred_scaled)[0][0])
-    return max(200, int(round(pred)))
+    # Remove the 200-floor so the model can output its true range
+    return max(50, int(round(pred)))
 
 # ─────────────────────────────────────────────────────────────
 # INITIALISE
